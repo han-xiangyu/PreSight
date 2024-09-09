@@ -121,7 +121,7 @@ def main():
         cfg.merge_from_dict(args.cfg_options)
 
     # set multi-process settings
-    setup_multi_processes(cfg)
+    # setup_multi_processes(cfg)
 
     # set cudnn_benchmark
     if cfg.get('cudnn_benchmark', False):

@@ -6,6 +6,22 @@ from mmcv.cnn.utils import kaiming_init, xavier_init, constant_init
 import numpy as np
 from mmcv.runner import BaseModule, force_fp32
 from IPython import embed
+import ipdb
+import MinkowskiEngine as ME
+from mmdet3d.models.backbones.res16unet import Res16UNet14E
+from mmcv import Config
+
+
+class ME_Voxelization(nn.Module):
+    def __init__(self, voxel_size):
+        super().__init__()
+        self.voxel_size = voxel_size
+
+    def forward(self, points):
+        # 使用MinkowskiEngine的sparse_quantize进行点云的体素化
+        return ME.utils.sparse_quantize(
+            points / self.voxel_size, device=points.device.type
+        )
 
 @NECKS.register_module()
 class PriorFusion2D(nn.Module):
@@ -133,7 +149,7 @@ class PriorFusion2D(nn.Module):
 class PriorFusion3D_voxel(nn.Module):
     def __init__(self,
                  prior_pc_range,
-                 prior_voxel_size,
+                 prior_voxel_size=[0.4, 0.4, 0.4],
                  bev_hidden_channels=256, 
                  prior_in_channels=68, 
                  prior_voxel_hidden_channels=64,
@@ -172,7 +188,8 @@ class PriorFusion3D_voxel(nn.Module):
         )
         
         self.block2 = nn.Sequential(
-            nn.Conv3d(int(bev_hidden_channels / out_num_z) + out_channels, out_channels, kernel_size=1, padding=0),
+            # nn.Conv3d(int(bev_hidden_channels / out_num_z) + out_channels, out_channels, kernel_size=1, padding=0),
+            nn.Conv3d(2 * out_channels, out_channels, kernel_size=1, padding=0),
             nn.BatchNorm3d(out_channels),
         )
         self.residual = residual
@@ -188,6 +205,77 @@ class PriorFusion3D_voxel(nn.Module):
             elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm3d):
                 constant_init(m, 1)
     
+
+    def split_coords_and_feats(self, coords, feats, batch_size):
+        """
+        将包含batch index的coords和卷积后的特征feats拆分回n个batch的list结构。
+        
+        Args:
+            coords: Tensor (num_points, 4) - 包含[batch_index, x, y, z]的4维坐标
+            feats: Tensor (num_points, feat_dim) - 对应点的特征
+            batch_size: int - batch 的大小(n)
+            
+        Returns:
+            split_coords_list: list of Tensors - 每个元素包含该batch的所有点的坐标
+            split_feats_list: list of Tensors - 每个元素包含该batch的所有点的特征
+        """
+        split_coords_list = []
+        split_feats_list = []
+        
+        # 遍历每个batch，分别提取属于该batch的坐标和特征
+        for i in range(batch_size):
+            # 获取属于当前batch的点索引
+            batch_mask = coords[:, 0] == i
+            
+            # 提取该batch的所有点的坐标（去掉第0列，即batch index）
+            batch_coords = coords[batch_mask, 1:]
+            
+            # 提取该batch的所有点的特征
+            batch_feats = feats[batch_mask]
+            
+            # 将结果添加到列表中
+            split_coords_list.append(batch_coords)
+            split_feats_list.append(batch_feats)
+        
+        return split_coords_list, split_feats_list
+
+    def extract_bg_points_features(self, prior_feats, prior_voxels_coords):
+        # 配置Res16UNet14E的初始化参数
+        config_dict = {
+            "in_channels": 68,  # 输入的通道数
+            "out_channels": 64,  # 输出的通道数
+            "bn_momentum": 0.1,  # BatchNorm的动量
+            "conv1_kernel_size": 3,  # 第一层卷积的核大小
+        }
+        config = Config(config_dict)
+
+
+        # voxelize_module = ME_Voxelization(self.prior_voxel_size)
+        # 创建batch index
+        batch_index = [
+            torch.ones((len(x), 1), device=prior_voxels_coords[0].device) * i
+            for i, x in enumerate(prior_voxels_coords)
+        ]
+        # 将所有点云的坐标、特征和batch索引拼接起来
+        coords = torch.cat(prior_voxels_coords, dim=0).int()
+        feats = torch.cat(prior_feats, dim=0)
+        batch_index = torch.cat(batch_index, dim=0).int()
+        # 将batch索引与坐标合并
+        coords = torch.cat([batch_index, coords], dim=1)
+        tensor = ME.SparseTensor(
+            features=feats.float(),
+            coordinates=coords,
+            quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+            minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+        )
+        # ipdb.set_trace()
+        # 初始化Res16UNet14E
+        spars3DConv = Res16UNet14E(config).to(coords.device)
+        # 对稀疏张量进行卷积运算
+        output = spars3DConv(tensor)
+
+        return output.coordinates, output.features
+    
     @force_fp32()
     def forward(self, bev_feats: torch.Tensor, prior_feats: torch.Tensor, prior_voxels_coords):
         """
@@ -197,34 +285,21 @@ class PriorFusion3D_voxel(nn.Module):
         """
 
         bs, bev_c, bev_h, bev_w, bev_z = bev_feats.shape
-        prior_feats_list = [self.voxel_feature_extractor(p) for p in prior_feats] # list[tensor(num_voxels, hidden)]
-        prior_voxels_feats = self.formulate_voxels(prior_feats_list, prior_voxels_coords) # (bs, w, h, z, hidden)
-        prior_voxels_feats = prior_voxels_feats.permute(0, 4, 3, 2, 1) # (bs, hidden1, z, h, w)
+        extracted_coords, extracted_feats = self.extract_bg_points_features(prior_feats, prior_voxels_coords)
+        split_coords, split_feats = self.split_coords_and_feats(extracted_coords, extracted_feats, bs)
+        prior_bev_feats = self.formulate_voxels(split_coords, split_feats) # (bs, w, h, z, hidden)
+        prior_bev_feats = prior_bev_feats.permute(0, 4, 2, 1, 3) # (bs, prior_feat_c, bev_h, bev_w, bev_z)
+        prior_bev_feats = F.interpolate(prior_bev_feats, size=(200, 200, 16), mode='trilinear', align_corners=False)
 
-        prior_bev_feats = prior_voxels_feats.flatten(1, 2) # (bs, hidden1*z, h, w)
-        bs, _, h, w = prior_bev_feats.shape
-
-        prior_bev_feats = self.block1(prior_bev_feats) # (bs, hidden2, h, w)
-        prior_bev_feats = F.max_pool2d(prior_bev_feats, kernel_size=2) # (bs, hidden2, h/2, w/2)
-
-        # aggregate bev voxel features
-        if prior_bev_feats.shape[-2:] != bev_feats.shape[-2:]:
-            prior_bev_feats = F.interpolate(prior_bev_feats, size=(bev_h, bev_w),
-                                            mode="bilinear", align_corners=True) # (bs, hidden2, bev_h, bev_w)
-        
-        assert self.out_num_z == bev_z
-        prior_bev_feats = prior_bev_feats.view(bs, -1, self.out_num_z, bev_h, bev_w).permute(0, 1, 3, 4, 2) 
-        # (bs, hidden2/z, bev_h, bev_w, bev_z)
-        
-        x = torch.cat([bev_feats, prior_bev_feats], dim=1) # (bs, hidden2/z+bev_c, bev_h, bev_w, bev_z)
+        x = torch.cat([bev_feats, prior_bev_feats], dim=1) # (bs, bev_c + prior_feat_c, bev_h, bev_w, bev_z)
         if self.residual:
-            bev_feats = F.relu(self.block2(x) + bev_feats) # (bs, bev_c, bev_h, bev_w, bev_z)
+            fused_bev_feats = F.relu(self.block2(x) + bev_feats) # (bs, bev_c, bev_h, bev_w, bev_z)
         else:
-            bev_feats = F.relu(self.block2(x)) # (bs, bev_c, bev_h, bev_w, bev_z)
+            fused_bev_feats = F.relu(self.block2(x)) # (bs, bev_c, bev_h, bev_w, bev_z)
+        return fused_bev_feats
 
-        return bev_feats
-    
-    def formulate_voxels(self, prior_voxels, prior_voxels_coords):
+
+    def formulate_voxels(self, prior_voxels_coords, prior_voxels):
         bs = len(prior_voxels)
         voxel_resolution = torch.ceil(
             (self.prior_pc_range[3:] - self.prior_pc_range[:3]) / self.prior_voxel_size
@@ -241,6 +316,63 @@ class PriorFusion3D_voxel(nn.Module):
         
         voxels = torch.stack(voxels)
         return voxels
+
+
+
+
+    # @force_fp32()
+    # def forward(self, bev_feats: torch.Tensor, prior_feats: torch.Tensor, prior_voxels_coords):
+    #     """
+    #         bev_feats: shape (bs, bev_c, bev_h, bev_w, bev_z)
+    #         prior_feats: list[tensor(num_voxels, c)]
+    #         prior_voxels_coords: list[tensor(num_voxels, 3)]
+    #     """
+
+    #     bs, bev_c, bev_h, bev_w, bev_z = bev_feats.shape
+    #     prior_feats_list = [self.voxel_feature_extractor(p) for p in prior_feats] # list[tensor(num_voxels, hidden)]
+    #     prior_voxels_feats = self.formulate_voxels(prior_feats_list, prior_voxels_coords) # (bs, w, h, z, hidden)
+    #     prior_voxels_feats = prior_voxels_feats.permute(0, 4, 3, 2, 1) # (bs, hidden1, z, h, w)
+
+    #     prior_bev_feats = prior_voxels_feats.flatten(1, 2) # (bs, hidden1*z, h, w)
+    #     bs, _, h, w = prior_bev_feats.shape
+
+    #     prior_bev_feats = self.block1(prior_bev_feats) # (bs, hidden2, h, w)
+    #     prior_bev_feats = F.max_pool2d(prior_bev_feats, kernel_size=2) # (bs, hidden2, h/2, w/2)
+
+    #     # aggregate bev voxel features
+    #     if prior_bev_feats.shape[-2:] != bev_feats.shape[-2:]:
+    #         prior_bev_feats = F.interpolate(prior_bev_feats, size=(bev_h, bev_w),
+    #                                         mode="bilinear", align_corners=True) # (bs, hidden2, bev_h, bev_w)
+        
+    #     assert self.out_num_z == bev_z
+    #     prior_bev_feats = prior_bev_feats.view(bs, -1, self.out_num_z, bev_h, bev_w).permute(0, 1, 3, 4, 2) 
+    #     # (bs, hidden2/z, bev_h, bev_w, bev_z)
+        
+    #     x = torch.cat([bev_feats, prior_bev_feats], dim=1) # (bs, hidden2/z+bev_c, bev_h, bev_w, bev_z)
+    #     if self.residual:
+    #         bev_feats = F.relu(self.block2(x) + bev_feats) # (bs, bev_c, bev_h, bev_w, bev_z)
+    #     else:
+    #         bev_feats = F.relu(self.block2(x)) # (bs, bev_c, bev_h, bev_w, bev_z)
+    #     # ipdb.set_trace()
+    #     return bev_feats
+    
+    # def formulate_voxels(self, prior_voxels, prior_voxels_coords):
+    #     bs = len(prior_voxels)
+    #     voxel_resolution = torch.ceil(
+    #         (self.prior_pc_range[3:] - self.prior_pc_range[:3]) / self.prior_voxel_size
+    #     ).long()
+    #     voxels = []
+    #     for i in range(bs):
+    #         points = prior_voxels[i]
+    #         coords = prior_voxels_coords[i].long()
+    #         dim_feats = points.size(1)
+    #         voxel = torch.zeros((*voxel_resolution, dim_feats), 
+    #                             dtype=torch.float32, device=points.device)
+    #         voxel[coords[:, 0], coords[:, 1], coords[:, 2]] = points.float()
+    #         voxels.append(voxel)
+        
+    #     voxels = torch.stack(voxels)
+    #     return voxels
 
 
 @NECKS.register_module()

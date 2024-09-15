@@ -168,10 +168,15 @@ def main():
         distributed = False
     else:
         distributed = True
-        init_dist(args.launcher, **cfg.dist_params)
+        # init_dist(args.launcher, **cfg.dist_params)
+        dist.init_process_group(backend="nccl")
+        cfg.gpu_ids =range(dist.get_world_size())
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        print(torch.distributed.get_world_size(), torch.distributed.get_rank())
+        print(os.environ)
         # re-set gpu_ids with distributed training mode
-        _, world_size = get_dist_info()
-        cfg.gpu_ids = range(world_size)
+        # _, world_size = get_dist_info()
+        # cfg.gpu_ids = range(world_size)
 
     # create work_dir
     mmcv.mkdir_or_exist(osp.abspath(cfg.work_dir))

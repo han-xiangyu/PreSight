@@ -6,6 +6,7 @@
 # ---------------------------------------------
 
 from .custom_base_transformer_layer import MyCustomBaseTransformerLayer
+import MinkowskiEngine as ME
 import copy
 import warnings
 from mmcv.cnn.bricks.registry import (ATTENTION,
@@ -35,7 +36,12 @@ class BEVFormerEncoder(TransformerLayerSequence):
             `LN`.
     """
 
-    def __init__(self, *args, pc_range=None, num_points_in_pillar=4, return_intermediate=False, dataset_type='nuscenes',
+    def __init__(self, *args, 
+                 pc_range=None, 
+                 num_points_in_pillar=4, 
+                 return_intermediate=False, 
+                 dataset_type='nuscenes',
+                 bg_points=None,
                  **kwargs):
 
         super(BEVFormerEncoder, self).__init__(*args, **kwargs)
@@ -44,6 +50,19 @@ class BEVFormerEncoder(TransformerLayerSequence):
         self.num_points_in_pillar = num_points_in_pillar
         self.pc_range = pc_range
         self.fp16_enabled = False
+        
+        if bg_points:
+            self.voxel_size = bg_points["voxel_size"]
+            self.bg_conv = ME.MinkowskiConvolution(
+                in_channels=bg_points["feature_size"],
+                out_channels=bg_points["feature_size"],
+                kernel_size=bg_points["out_kernel_size"],
+                stride=1,
+                dimension=3,
+                expand_coordinates=False,
+            )
+        else:
+            self.bg_conv = None
 
     @staticmethod
     def get_reference_points(H, W, Z=8, num_points_in_pillar=4, dim='3d', bs=1, device='cuda', dtype=torch.float):
@@ -141,9 +160,10 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 np.nan_to_num(bev_mask.cpu().numpy()))
 
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
+        reference_points = reference_points.squeeze(-1).permute(2, 1, 3, 0, 4)[..., :3]
         bev_mask = bev_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
 
-        return reference_points_cam, bev_mask
+        return reference_points_cam, reference_points, bev_mask
 
     @auto_fp16()
     def forward(self,
@@ -158,6 +178,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 level_start_index=None,
                 prev_bev=None,
                 shift=0.,
+                bg_points_feature=None,
                 **kwargs):
         """Forward function for `TransformerDecoder`.
         Args:
@@ -186,8 +207,45 @@ class BEVFormerEncoder(TransformerLayerSequence):
         ref_2d = self.get_reference_points(
             bev_h, bev_w, dim='2d', bs=bev_query.size(1), device=bev_query.device, dtype=bev_query.dtype)
 
-        reference_points_cam, bev_mask = self.point_sampling(
+        reference_points_cam, reference_points_3d, bev_mask = self.point_sampling(
             ref_3d, self.pc_range, kwargs['img_metas'])
+
+        if self.bg_conv is not None and bg_points_feature is not None:
+            n_cam, bs, n_xy, n_z, _ = reference_points_3d.shape
+            reference_points_3d = reference_points_3d.permute(1, 0, 2, 3, 4)
+            reference_points_3d = reference_points_3d.reshape(bs, -1, 3)[0]
+            # since ref points are all the same across batches
+            sp_coord = (reference_points_3d / self.voxel_size).int()
+            batch_coord = torch.ones(
+                (len(sp_coord), 1), device=sp_coord.device, dtype=torch.int
+            )
+            sp_coord = torch.tile(sp_coord[None, ...], (bs, 1, 1))
+            batch_coord = torch.tile(batch_coord[None, ...], (bs, 1, 1))
+            batch_coord = (
+                batch_coord
+                * torch.arange(bs, device=sp_coord.device, dtype=torch.int)[
+                    :, None, None
+                ]
+            )
+            curr_coord = torch.cat([batch_coord, sp_coord], dim=-1)
+            curr_coord = curr_coord.reshape(-1, 4)
+            query_field = ME.TensorField(
+                features=torch.ones((curr_coord.shape[0], 1), device=curr_coord.device),
+                coordinates=curr_coord,
+                quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+                # quantization_mode=ME.SparseTensorQuantizationMode.RANDOM_SUBSAMPLE,
+                minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+                coordinate_manager=bg_points_feature.coordinate_manager,
+            )
+            query_sparse = query_field.sparse()
+            conv_at_current = self.bg_conv(bg_points_feature, coordinates=query_sparse)
+            # slice the features
+            reference_features = conv_at_current.slice(query_field).F
+            reference_features = reference_features.reshape(bs, n_cam, n_xy, n_z, -1)
+            reference_features = reference_features.permute(1, 0, 2, 3, 4)
+        else:
+            reference_features = None
+
 
         # bug: this code should be 'shift_ref_2d = ref_2d.clone()', we keep this bug for reproducing our results in paper.
         # shift_ref_2d = ref_2d  # .clone()
@@ -222,6 +280,7 @@ class BEVFormerEncoder(TransformerLayerSequence):
                 spatial_shapes=spatial_shapes,
                 level_start_index=level_start_index,
                 reference_points_cam=reference_points_cam,
+                reference_features=reference_features,
                 bev_mask=bev_mask,
                 prev_bev=prev_bev,
                 **kwargs)
@@ -296,6 +355,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                 bev_h=None,
                 bev_w=None,
                 reference_points_cam=None,
+                reference_features=None,
                 mask=None,
                 spatial_shapes=None,
                 level_start_index=None,
@@ -386,6 +446,7 @@ class BEVFormerLayer(MyCustomBaseTransformerLayer):
                     key_pos=key_pos,
                     reference_points=ref_3d,
                     reference_points_cam=reference_points_cam,
+                    reference_features=reference_features,
                     mask=mask,
                     attn_mask=attn_masks[attn_index],
                     key_padding_mask=key_padding_mask,

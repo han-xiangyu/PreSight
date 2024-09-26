@@ -83,6 +83,7 @@ class PerceptionTransformer(BaseModule):
             bev_w,
             bev_pos=None,
             prev_bev=None,
+            bg_points_feature=None,
             **kwargs):
         """
         obtain bev features.
@@ -128,6 +129,7 @@ class PerceptionTransformer(BaseModule):
             level_start_index=level_start_index,
             prev_bev=prev_bev,
             shift=shift,
+            bg_points_feature=bg_points_feature,
             **kwargs
         )
 

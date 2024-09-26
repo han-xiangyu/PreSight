@@ -18,8 +18,8 @@ img_h = 480
 img_w = 800
 img_size = (img_h, img_w)
 
-num_gpus = 8
-batch_size = 4
+num_gpus = 4
+batch_size = 8
 num_iters_per_epoch = 24539 // (num_gpus * batch_size)
 num_epochs = 24
 total_iters = num_iters_per_epoch * num_epochs
@@ -66,19 +66,29 @@ norm_cfg = dict(type='BN2d')
 num_class = max(list(cat2id.values()))+1
 num_points = 20
 permute = True
+num_points_in_pillar = 16
 
 model = dict(
     type='StreamMapNet',
     roi_size=roi_size,
     bev_h=bev_h,
     bev_w=bev_w,
-    hindsight=False,
+    hindsight=True,
     backbone_cfg=dict(
         type='BEVFormerBackbone',
         roi_size=roi_size,
         bev_h=bev_h,
         bev_w=bev_w,
         use_grid_mask=True,
+        bg_points=dict(
+            backbone=dict(
+                type='Res16UNet14E',
+                cfg=dict(
+                    in_channels=68,
+                    bn_momentum=0.05,
+                    conv1_kernel_size=3,
+                    out_channels=64, # this is the final feature dimension for bg points features
+                    simple_conv_kernel_size=5))),
         img_backbone=dict(
             type='ResNet',
             with_cp=False,
@@ -109,8 +119,13 @@ model = dict(
                 type='BEVFormerEncoder',
                 num_layers=1,
                 pc_range=pc_range,
-                num_points_in_pillar=4,
+                num_points_in_pillar=num_points_in_pillar,
                 return_intermediate=False,
+                bg_points=dict(
+                    voxel_size=voxel_size[0],
+                    feature_size=64,
+                    out_kernel_size=5,
+                ),
                 transformerlayers=dict(
                     type='BEVFormerLayer',
                     attn_cfgs=[
@@ -121,9 +136,11 @@ model = dict(
                         dict(
                             type='SpatialCrossAttention',
                             deformable_attention=dict(
-                                type='MSDeformableAttention3D',
+                                type='MSDeformableAttentionBGP3D',
                                 embed_dims=bev_embed_dims,
-                                num_points=8,
+                                num_Z_anchors=num_points_in_pillar,
+                                bg_feature_dim=64,
+                                num_points=32,
                                 num_levels=num_feat_levels),
                             embed_dims=bev_embed_dims,
                         )
@@ -403,7 +420,8 @@ lr_config = dict(
     policy='CosineAnnealing',
     warmup='linear',
     warmup_iters=500,
-    warmup_ratio=1.0 / 3,
+    # warmup_ratio=1.0 / 3,
+    warmup_ratio=1.0,
     min_lr_ratio=3e-3)
 
 evaluation = dict(interval=num_epochs*num_iters_per_epoch)
@@ -420,5 +438,5 @@ log_config = dict(
         dict(type='TensorboardLoggerHook')
     ])
 
-SyncBN = True
+SyncBN = False
 # resume_from = "work_dirs/smn_wcamprior_480_100x50_24e/latest.pth"

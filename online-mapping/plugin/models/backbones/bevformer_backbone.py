@@ -13,6 +13,9 @@ from mmdet.models.utils import build_transformer
 from mmcv.cnn.bricks.transformer import FFN, build_positional_encoding
 from .bevformer.grid_mask import GridMask
 from mmdet3d.models import builder
+import MinkowskiEngine as ME
+from mmdet3d.models.builder import build_backbone
+import ipdb
 
 
 class UpsampleBlock(nn.Module):
@@ -66,8 +69,19 @@ class BEVFormerBackbone(nn.Module):
                  use_grid_mask=True,
                  upsample=False,
                  up_outdim=128,
+                 bg_points=None,
                  **kwargs):
         super(BEVFormerBackbone, self).__init__()
+
+        if bg_points is not None:
+            self.bg_points = nn.ModuleDict(
+                {
+                    "backbone": build_backbone(bg_points["backbone"]),
+                }
+            )
+        else:
+            self.bg_points = None
+
 
         # image feature
         self.grid_mask = GridMask(
@@ -153,7 +167,30 @@ class BEVFormerBackbone(nn.Module):
         
         return img_feats_reshaped
 
-    def forward(self, img, img_metas, *args, prev_bev=None, only_bev=False, **kwargs):
+    def extract_bg_points_features(self, prior_voxels, prior_voxels_coords):
+        # 创建batch index
+        batch_index = [
+            torch.ones((len(x), 1), device=prior_voxels_coords[0].device) * i
+            for i, x in enumerate(prior_voxels_coords)
+        ]
+        # 将所有点云的坐标、特征和batch索引拼接起来
+        coords = torch.cat(prior_voxels_coords, dim=0).int()
+        feats = torch.cat(prior_voxels, dim=0)
+        batch_index = torch.cat(batch_index, dim=0).int()
+        # 将batch索引与坐标合并
+        coords = torch.cat([batch_index, coords], dim=1)
+
+        tensor = ME.SparseTensor(
+            features=feats,
+            coordinates=coords,
+            quantization_mode=ME.SparseTensorQuantizationMode.UNWEIGHTED_AVERAGE,
+            minkowski_algorithm=ME.MinkowskiAlgorithm.SPEED_OPTIMIZED,
+        )
+        return self.bg_points["backbone"](tensor)
+
+
+
+    def forward(self, img, img_metas, *args, prev_bev=None, only_bev=False, prior_voxels=None, prior_voxels_coords=None, **kwargs):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): Features from the upstream
@@ -180,6 +217,12 @@ class BEVFormerBackbone(nn.Module):
                             device=bev_queries.device).to(dtype)
         bev_pos = self.positional_encoding(bev_mask).to(dtype)
 
+        if self.bg_points is not None and prior_voxels[0].shape[0] != 0 and prior_voxels_coords[0].shape[0] != 0 :
+            bg_points_feature = self.extract_bg_points_features(prior_voxels, prior_voxels_coords)
+        else:
+            bg_points_feature = None
+
+
         outs =  self.transformer.get_bev_features(
                 mlvl_feats,
                 bev_queries,
@@ -190,6 +233,7 @@ class BEVFormerBackbone(nn.Module):
                 bev_pos=bev_pos,
                 img_metas=img_metas,
                 prev_bev=prev_bev,
+                bg_points_feature=bg_points_feature
             )
         
         outs = outs.unflatten(1,(self.bev_h,self.bev_w)).permute(0,3,1,2).contiguous()

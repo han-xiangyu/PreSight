@@ -27,6 +27,7 @@ class StreamMapNet(BaseMapper):
                  model_name=None, 
                  streaming_cfg={},
                  prior_fuse_cfg={},
+                 hindsight=False,
                  pretrained=None,
                  freeze_backbone=False,
                  freeze_neck=False,
@@ -35,6 +36,7 @@ class StreamMapNet(BaseMapper):
         super().__init__()
 
         #Attribute
+        self.hindsight = hindsight
         self.model_name = model_name
         self.last_epoch = None
   
@@ -181,21 +183,22 @@ class StreamMapNet(BaseMapper):
         
         bs = img.shape[0]
 
-        # Backbone
-        bev_feats = self.backbone(img, img_metas=img_metas, points=points)
+        # Backbone: capable of handling hindsight and presight cases simultaneously
+        bev_feats = self.backbone(img, img_metas=img_metas, points=points, prior_voxels=prior_voxels, prior_voxels_coords=prior_voxels_coords)
         
         if self.streaming_bev:
             self.bev_memory.train()
             bev_feats = self.update_bev_feature(bev_feats, img_metas)
         
         # Priors
-        if hasattr(self, "prior_fusion_module"):
-            assert prior_voxels is not None
-        if prior_voxels is not None:
-            # prior_voxels = self.formulate_voxels(prior_voxels, prior_voxels_coords) # (bs, w, h, z, c)
-            # prior_voxels = prior_voxels.permute(0, 4, 3, 2, 1) # (bs, c, z, h, w)
-            fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels, prior_voxels_coords)
-            bev_feats = fused_bev_feats
+        if self.hindsight == False:
+            if hasattr(self, "prior_fusion_module"):
+                assert prior_voxels is not None
+            if prior_voxels is not None:
+                # prior_voxels = self.formulate_voxels(prior_voxels, prior_voxels_coords) # (bs, w, h, z, c)
+                # prior_voxels = prior_voxels.permute(0, 4, 3, 2, 1) # (bs, c, z, h, w)
+                fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels, prior_voxels_coords)
+                bev_feats = fused_bev_feats
 
         preds_list, loss_dict, det_match_idxs, det_match_gt_idxs = self.head(
             bev_features=bev_feats, 
@@ -229,7 +232,7 @@ class StreamMapNet(BaseMapper):
         for img_meta in img_metas:
             tokens.append(img_meta['token'])
 
-        bev_feats = self.backbone(img, img_metas, points=points)
+        bev_feats = self.backbone(img, img_metas=img_metas, points=points, prior_voxels=prior_voxels, prior_voxels_coords=prior_voxels_coords)
         img_shape = [bev_feats.shape[2:] for i in range(bev_feats.shape[0])]
 
         if self.streaming_bev:
@@ -237,14 +240,15 @@ class StreamMapNet(BaseMapper):
             bev_feats = self.update_bev_feature(bev_feats, img_metas)
         
         # Priors
-        if hasattr(self, "prior_fusion_module"):
-            assert prior_voxels is not None
-        if prior_voxels is not None:
-            # prior_voxels = self.formulate_voxels(prior_voxels, prior_voxels_coords) # (bs, w, h, z, c)
-            # prior_voxels = prior_voxels.permute(0, 4, 3, 2, 1) # (bs, c, z, h, w)
-            fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels, prior_voxels_coords)
-            # fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels)
-            bev_feats = fused_bev_feats
+        if self.hindsight == False:
+            if hasattr(self, "prior_fusion_module"):
+                assert prior_voxels is not None
+            if prior_voxels is not None:
+                # prior_voxels = self.formulate_voxels(prior_voxels, prior_voxels_coords) # (bs, w, h, z, c)
+                # prior_voxels = prior_voxels.permute(0, 4, 3, 2, 1) # (bs, c, z, h, w)
+                fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels, prior_voxels_coords)
+                # fused_bev_feats = self.prior_fusion_module(bev_feats, prior_voxels)
+                bev_feats = fused_bev_feats
         
         preds_list = self.head(bev_feats, img_metas=img_metas, return_loss=False)
         

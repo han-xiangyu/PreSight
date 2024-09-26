@@ -8,7 +8,6 @@ plugin = True
 
 # plugin code dir
 plugin_dir = 'plugin/'
-data_root = './data/nuScenes'
 
 # img configs
 img_norm_cfg = dict(
@@ -23,8 +22,6 @@ batch_size = 4
 num_iters_per_epoch = 24539 // (num_gpus * batch_size)
 num_epochs = 24
 total_iters = num_iters_per_epoch * num_epochs
-num_epochs_single_frame = num_epochs // 6
-num_queries = 100
 
 # category configs
 cat2id = {
@@ -39,8 +36,7 @@ roi_size = (100, 50)
 bev_h = 50
 bev_w = 100
 pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
-prior_pc_range = [-roi_size[0]/2, -roi_size[1]/2, -3, roi_size[0]/2, roi_size[1]/2, 5]
-voxel_size = [0.5, 0.5, 0.5]
+voxel_size=[0.5, 0.5, 0.5]
 prior_type = "camera_priors"
 
 # vectorize params
@@ -56,7 +52,7 @@ meta = dict(
     use_radar=False,
     use_map=False,
     use_external=False,
-    output_format='vector')
+    output_format='raster')
 
 # model configs
 bev_embed_dims = 256
@@ -68,11 +64,10 @@ num_points = 20
 permute = True
 
 model = dict(
-    type='StreamMapNet',
+    type='RasterMapper',
     roi_size=roi_size,
     bev_h=bev_h,
     bev_w=bev_w,
-    hindsight=False,
     backbone_cfg=dict(
         type='BEVFormerBackbone',
         roi_size=roi_size,
@@ -142,107 +137,10 @@ model = dict(
             col_num_embed=bev_w,
             ),
     ),
-    head_cfg=dict(
-        type='MapDetectorHead',
-        num_queries=num_queries,
-        embed_dims=embed_dims,
-        num_classes=num_class,
-        in_channels=embed_dims//2,
-        num_points=num_points,
-        roi_size=roi_size,
-        coord_dim=2,
-        different_heads=False,
-        predict_refine=False,
-        sync_cls_avg_factor=True,
-        streaming_cfg=dict(
-            streaming=True,
-            batch_size=batch_size,
-            topk=int(num_queries*(1/3)),
-            trans_loss_weight=0.1,
-        ),
-        transformer=dict(
-            type='MapTransformer',
-            num_feature_levels=1,
-            num_points=num_points,
-            coord_dim=2,
-            encoder=dict(
-                type='PlaceHolderEncoder',
-                embed_dims=embed_dims,
-            ),
-            decoder=dict(
-                type='MapTransformerDecoder_new',
-                num_layers=6,
-                prop_add_stage=1,
-                return_intermediate=True,
-                transformerlayers=dict(
-                    type='MapTransformerLayer',
-                    attn_cfgs=[
-                        dict(
-                            type='MultiheadAttention',
-                            embed_dims=embed_dims,
-                            num_heads=8,
-                            attn_drop=0.1,
-                            proj_drop=0.1,
-                        ),
-                        dict(
-                            type='CustomMSDeformableAttention',
-                            embed_dims=embed_dims,
-                            num_heads=8,
-                            num_levels=1,
-                            num_points=num_points,
-                            dropout=0.1,
-                        ),
-                    ],
-                    ffn_cfgs=dict(
-                        type='FFN',
-                        embed_dims=embed_dims,
-                        feedforward_channels=embed_dims*2,
-                        num_fcs=2,
-                        ffn_drop=0.1,
-                        act_cfg=dict(type='ReLU', inplace=True),        
-                    ),
-                    feedforward_channels=embed_dims*2,
-                    ffn_dropout=0.1,
-                    # operation_order=('norm', 'self_attn', 'norm', 'cross_attn',
-                    #                 'norm', 'ffn',)
-                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                    'ffn', 'norm')
-                )
-            )
-        ),
-        loss_cls=dict(
-            type='FocalLoss',
-            use_sigmoid=True,
-            gamma=2.0,
-            alpha=0.25,
-            loss_weight=5.0
-        ),
-        loss_reg=dict(
-            type='LinesL1Loss',
-            loss_weight=50.0,
-            beta=0.01,
-        ),
-        assigner=dict(
-            type='HungarianLinesAssigner',
-                cost=dict(
-                    type='MapQueriesCost',
-                    cls_cost=dict(type='FocalLossCost', weight=5.0),
-                    reg_cost=dict(type='LinesL1Cost', weight=50.0, beta=0.01, permute=permute),
-                    ),
-                ),
-        ),
-    streaming_cfg=dict(
-        streaming_bev=True,
-        batch_size=batch_size,
-        fusion_cfg=dict(
-            type='ConvGRU',
-            out_channels=bev_embed_dims,
-        )
-    ),
     prior_fuse_cfg=dict(
         fusion_module_cfg=dict(
             type="PriorFusion2D",
-            prior_pc_range=prior_pc_range,
+            prior_pc_range=pc_range,
             prior_voxel_size=voxel_size,
             bev_feats_channels=bev_embed_dims,
             voxel_channels=64 + 3 + 1,
@@ -251,22 +149,30 @@ model = dict(
             dropout=0.1,
         ),
     ),
-    model_name='SingleStage'
+    head_cfg=dict(
+        type='BevDecoder',
+        inC=bev_embed_dims,
+        outC=num_class,
+    ),
+    loss_cfg=dict(
+        type="SimpleLoss",
+        pos_weight=2.13,
+        loss_weight=1.0
+    ),
+    model_name='RasterMapper'
 )
 
 # data processing pipelines
 train_pipeline = [
     dict(
-        type='VectorizeMap',
-        coords_dim=coords_dim,
+        type='RasterizeMap',
         roi_size=roi_size,
-        sample_num=num_points,
-        normalize=True,
-        permute=permute,
+        canvas_size=[400, 200],
+        thickness=5,
     ),
     dict(
         type='VoxelizePriorPoints',
-        pc_range=prior_pc_range,
+        pc_range=pc_range,
         voxel_size=voxel_size,
         max_voxels=100000,
         max_points_per_voxel=16,
@@ -281,7 +187,7 @@ train_pipeline = [
     dict(type='Normalize3D', **img_norm_cfg),
     dict(type='PadMultiViewImages', size_divisor=32),
     dict(type='FormatBundleMap'),
-    dict(type='Collect3D', keys=['img', 'vectors', 'prior_voxels', 'prior_voxels_coords'], meta_keys=(
+    dict(type='Collect3D', keys=['img', 'semantic_mask', 'prior_voxels', 'prior_voxels_coords'], meta_keys=(
         'token', 'ego2img', 'sample_idx', 'ego2global_translation',
         'ego2global_rotation', 'img_shape', 'scene_name'))
 ]
@@ -290,7 +196,7 @@ train_pipeline = [
 test_pipeline = [
     dict(
         type='VoxelizePriorPoints',
-        pc_range=prior_pc_range,
+        pc_range=pc_range,
         voxel_size=voxel_size,
         max_voxels=100000,
         max_points_per_voxel=16,
@@ -312,21 +218,20 @@ test_pipeline = [
 # DO NOT CHANGE
 eval_config = dict(
     type='NuscDataset',
-    data_root=data_root,
+    data_root='./data/nuScenes',
     ann_file='./data/nuScenes/nuscenes_map_infos_val_priorsplit.pkl',
     meta=meta,
     roi_size=roi_size,
     cat2id=cat2id,
     pipeline=[
         dict(
-            type='VectorizeMap',
-            coords_dim=coords_dim,
-            simplify=True,
-            normalize=False,
-            roi_size=roi_size
+            type='RasterizeMap',
+            roi_size=roi_size,
+            canvas_size=[400, 200],
+            thickness=5,
         ),
         dict(type='FormatBundleMap'),
-        dict(type='Collect3D', keys=['vectors'], meta_keys=['token'])
+        dict(type='Collect3D', keys=['semantic_mask'], meta_keys=['token'])
     ],
     interval=1,
 )
@@ -337,60 +242,57 @@ data = dict(
     workers_per_gpu=4,
     train=dict(
         type='NuscDataset',
-        data_root=data_root,
+        data_root='./data/nuScenes',
         ann_file='./data/nuScenes/nuscenes_map_infos_train_priorsplit.pkl',
         meta=meta,
         prior_type=prior_type,
         prior_city_parts={"boston-seaport": 8, "singapore-queenstown": 4},
-        prior_pc_ranges=prior_pc_range,
+        prior_pc_ranges=pc_range,
         roi_size=roi_size,
         cat2id=cat2id,
         pipeline=train_pipeline,
-        seq_split_num=1,
+        seq_split_num=-1,
     ),
     val=dict(
         type='NuscDataset',
-        data_root=data_root,
+        data_root='./data/nuScenes',
         ann_file='./data/nuScenes/nuscenes_map_infos_val_priorsplit.pkl',
         meta=meta,
         prior_type=prior_type,
         prior_city_parts={"singapore-hollandvillage": 2, "singapore-onenorth": 4},
-        prior_pc_ranges=prior_pc_range,
+        prior_pc_ranges=pc_range,
         roi_size=roi_size,
         cat2id=cat2id,
         pipeline=test_pipeline,
         eval_config=eval_config,
         test_mode=True,
-        seq_split_num=1,
+        seq_split_num=-1,
     ),
     test=dict(
         type='NuscDataset',
-        data_root=data_root,
+        data_root='./data/nuScenes',
         ann_file='./data/nuScenes/nuscenes_map_infos_val_priorsplit.pkl',
         meta=meta,
         prior_type=prior_type,
         prior_city_parts={"singapore-hollandvillage": 2, "singapore-onenorth": 4},
-        prior_pc_ranges=prior_pc_range,
+        prior_pc_ranges=pc_range,
         roi_size=roi_size,
         cat2id=cat2id,
         pipeline=test_pipeline,
         eval_config=eval_config,
         test_mode=True,
-        seq_split_num=1,
+        seq_split_num=-1,
     ),
     shuffler_sampler=dict(
         type='InfiniteGroupEachSampleInBatchSampler',
-        seq_split_num=2,
-        num_iters_to_seq=num_epochs_single_frame*num_iters_per_epoch,
-        random_drop=0.0
     ),
-    nonshuffler_sampler=dict(type='DistributedSampler')
+    nonshuffler_sampler=dict(type='DistributedSampler'),
 )
 
 # optimizer
 optimizer = dict(
     type='AdamW',
-    lr=5e-4,
+    lr=1e-3,
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
@@ -407,18 +309,17 @@ lr_config = dict(
     min_lr_ratio=3e-3)
 
 evaluation = dict(interval=num_epochs*num_iters_per_epoch)
-find_unused_parameters = True #### when use checkpoint, find_unused_parameters must be False
+find_unused_parameters = False #### when use checkpoint, find_unused_parameters must be False
 checkpoint_config = dict(interval=num_epochs//6*num_iters_per_epoch, max_keep_ckpts=1)
 
 runner = dict(
     type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 
 log_config = dict(
-    interval=100,
+    interval=50,
     hooks=[
         dict(type='TextLoggerHook'),
         dict(type='TensorboardLoggerHook')
     ])
 
 SyncBN = True
-# resume_from = "work_dirs/smn_wcamprior_480_100x50_24e/latest.pth"
